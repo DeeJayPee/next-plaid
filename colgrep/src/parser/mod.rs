@@ -39,10 +39,54 @@ pub use types::{CodeUnit, Language, UnitType};
 
 // Internal imports
 use analysis::extract_file_imports;
-use ast::{get_node_name, is_class_node, is_constant_node, is_function_node};
+use ast::{find_class_body, get_node_name, is_class_node, is_constant_node, is_function_node};
 use extract::{extract_class, extract_constant, extract_function, fill_raw_code_gaps};
 use language::get_tree_sitter_language;
 use text::extract_text_units;
+
+/// Abstract type-contract nodes (interfaces, traits, protocols, type aliases,
+/// enums) where recursing into the body produces method-signature chunks that
+/// drown out the canonical name match. Empirically responsible for the
+/// circe / zod / axum / guzzle regressions when `recurse_class_bodies` is on.
+fn is_abstract_type_container(kind: &str, lang: Language) -> bool {
+    match lang {
+        Language::Rust => kind == "trait_item",
+        Language::TypeScript | Language::Vue | Language::Svelte => matches!(
+            kind,
+            "interface_declaration" | "type_alias_declaration" | "enum_declaration"
+        ),
+        Language::Java | Language::CSharp => {
+            matches!(kind, "interface_declaration" | "enum_declaration")
+        }
+        Language::Scala => kind == "trait_definition",
+        Language::Swift => matches!(kind, "protocol_declaration" | "enum_declaration"),
+        Language::Kotlin => kind == "interface_declaration",
+        Language::Php => matches!(
+            kind,
+            "interface_declaration" | "trait_declaration" | "enum_declaration"
+        ),
+        Language::Cpp => kind == "enum_specifier",
+        _ => false,
+    }
+}
+
+/// True if the body has at least one direct or nested function-like child.
+/// Used to gate recursion into C++ structs: type-trait / POD structs (no
+/// function children) skip recursion to avoid drowning the canonical match
+/// with empty member chunks; behaviour-bearing structs like `formatter<T>`
+/// still recurse and contribute their methods.
+fn body_has_function_descendant(body: Node, lang: Language) -> bool {
+    let mut stack: Vec<Node> = body.children(&mut body.walk()).collect();
+    while let Some(node) = stack.pop() {
+        if is_function_node(node.kind(), lang) {
+            return true;
+        }
+        for child in node.children(&mut node.walk()) {
+            stack.push(child);
+        }
+    }
+    false
+}
 
 use crate::config::{Config, DEFAULT_MAX_RECURSION_DEPTH};
 
@@ -200,13 +244,57 @@ fn extract_from_node(
     }
     // Check if this is a class definition
     else if is_class_node(kind, lang) {
-        if get_node_name(node, bytes, lang).is_some() {
-            // Extract class as a single chunk (do NOT recurse into methods)
-            // This keeps the entire class as one unit for better semantic coherence
+        if let Some(class_name) = get_node_name(node, bytes, lang) {
+            // Always push the class as its own unit so the class-level query
+            // (e.g. `SqlMapper`) still resolves to the canonical declaration.
             if let Some(unit) = extract_class(node, path, lines, bytes, lang, file_imports) {
                 units.push(unit);
             }
-            return; // Don't recurse into class body - keep class as single chunk
+            // When the env flag is on, also recurse into the body so each
+            // method / nested function becomes its own searchable unit. This
+            // is the parser-side fix for the SqlMapper/BaseModel/Application
+            // family of failures documented in MISSION.md § Lever 1.
+            // Recurse into the class body so each method becomes its own
+            // searchable unit alongside the class — this matches semble's
+            // chunking granularity (one BM25 row / one ColBERT vector per
+            // method) and stops BM25 length-normalisation from punishing the
+            // canonical-implementation file on symbol queries like
+            // `SqlMapper`, `BaseModel`, `Vitest`, `Application`. Abstract
+            // type contracts (interfaces, traits, protocols, type aliases,
+            // enums) are excluded — their member signatures would only
+            // dilute the canonical name match.
+            if !is_abstract_type_container(kind, lang) {
+                if let Some(body) = find_class_body(node, lang) {
+                    // Skip recursion when the body has no function-like
+                    // descendant. Catches "type-only" containers naturally
+                    // across languages: C++ POD / type-trait structs,
+                    // Rust `struct_item` / `enum_item` (whose methods live
+                    // in separate `impl_item` blocks), Java `record` fields,
+                    // etc. Behaviour-bearing containers (Rust `impl_item`,
+                    // Python `class`, C++ structs with methods like
+                    // fmtlib's `formatter<T>`) still recurse and contribute
+                    // their methods.
+                    if !body_has_function_descendant(body, lang) {
+                        return;
+                    }
+                    for child in body.children(&mut body.walk()) {
+                        extract_from_node(
+                            child,
+                            path,
+                            lines,
+                            bytes,
+                            lang,
+                            units,
+                            Some(&class_name),
+                            file_imports,
+                            depth + 1,
+                            max_depth,
+                            depth_limit_hit,
+                        );
+                    }
+                }
+            }
+            return; // Don't fall through to the generic recurse below.
         }
     }
     // Check if this is a top-level constant/static declaration (only at module level)
