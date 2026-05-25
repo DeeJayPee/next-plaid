@@ -34,6 +34,16 @@ thread_local! {
     static UPDATE_PROGRESS: RefCell<Option<Box<dyn Fn(&str, &str)>>> = RefCell::new(None);
 }
 
+struct ProgressGuard;
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        UPDATE_PROGRESS.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
 /// Run an update operation with a thread-local progress callback.
 ///
 /// The callback is intentionally thread-local because update work runs inside one blocking
@@ -45,11 +55,8 @@ where
     UPDATE_PROGRESS.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(callback));
     });
-    let result = operation();
-    UPDATE_PROGRESS.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-    result
+    let _guard = ProgressGuard;
+    operation()
 }
 
 fn emit_update_progress(stage: &str, message: &str) {
@@ -1112,6 +1119,10 @@ pub fn update_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn test_update_config_default() {
@@ -1119,6 +1130,35 @@ mod tests {
         assert_eq!(config.batch_size, 50_000);
         assert_eq!(config.buffer_size, 100);
         assert_eq!(config.start_from_scratch, 999);
+    }
+
+    #[test]
+    fn test_update_progress_clears_after_panic() {
+        let stale_count = Arc::new(AtomicUsize::new(0));
+        let stale_count_for_callback = Arc::clone(&stale_count);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_update_progress(
+                move |_, _| {
+                    stale_count_for_callback.fetch_add(1, Ordering::SeqCst);
+                },
+                || panic!("forced progress panic"),
+            );
+        }));
+
+        assert!(result.is_err());
+
+        emit_update_progress("after_panic", "must not hit stale callback");
+        assert_eq!(stale_count.load(Ordering::SeqCst), 0);
+
+        let fresh_count = Arc::new(AtomicUsize::new(0));
+        let fresh_count_for_callback = Arc::clone(&fresh_count);
+        with_update_progress(
+            move |_, _| {
+                fresh_count_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+            || emit_update_progress("fresh", "fresh callback"),
+        );
+        assert_eq!(fresh_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
