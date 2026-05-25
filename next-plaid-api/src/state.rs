@@ -48,7 +48,8 @@ impl IndexSlot {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiConfig, AppState};
+    use super::{ApiConfig, AppState, UPDATE_STATUS_RETENTION};
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn update_health_status_tracks_active_and_completed_updates() {
@@ -76,6 +77,17 @@ mod tests {
         let complete = state.get_update_health_statuses();
         assert_eq!(complete[0].status, "complete");
         assert_eq!(complete[0].processed_documents, Some(3));
+
+        state
+            .update_progress
+            .write()
+            .get_mut("docs")
+            .unwrap()
+            .updated_at = SystemTime::now() - UPDATE_STATUS_RETENTION - Duration::from_secs(1);
+        assert!(state.get_update_health_statuses().is_empty());
+
+        state.record_update_queued("other", 1, "queued");
+        assert!(!state.update_progress.read().contains_key("docs"));
     }
 }
 
@@ -134,6 +146,19 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     year += if month <= 2 { 1 } else { 0 };
     (year, month, day)
+}
+
+fn prune_expired_update_progress(progress: &mut HashMap<String, UpdateProgress>, now: SystemTime) {
+    progress.retain(|_, item| update_progress_is_visible(item, now));
+}
+
+fn update_progress_is_visible(item: &UpdateProgress, now: SystemTime) -> bool {
+    item.status == "queued"
+        || item.status == "running"
+        || now
+            .duration_since(item.updated_at)
+            .map(|age| age <= UPDATE_STATUS_RETENTION)
+            .unwrap_or(true)
 }
 
 /// Configuration for the API server.
@@ -553,6 +578,7 @@ impl AppState {
     pub fn record_update_queued(&self, name: &str, queued_documents: usize, message: &str) {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
         if let Some(existing) = progress.get_mut(name) {
             existing.queued_documents = Some(
                 existing
@@ -591,6 +617,7 @@ impl AppState {
     pub fn record_update_stage(&self, name: &str, stage: &str, message: &str) {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
         let entry = progress
             .entry(name.to_string())
             .or_insert_with(|| UpdateProgress {
@@ -614,6 +641,7 @@ impl AppState {
     pub fn record_update_complete(&self, name: &str, processed_documents: usize, message: &str) {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
         let entry = progress
             .entry(name.to_string())
             .or_insert_with(|| UpdateProgress {
@@ -638,6 +666,7 @@ impl AppState {
     pub fn record_update_failed(&self, name: &str, error: &str) {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
         let entry = progress
             .entry(name.to_string())
             .or_insert_with(|| UpdateProgress {
@@ -660,18 +689,11 @@ impl AppState {
     /// Get active and recent update progress for the health endpoint.
     pub fn get_update_health_statuses(&self) -> Vec<UpdateHealthStatus> {
         let now = SystemTime::now();
-        let mut progress = self.update_progress.write();
-        progress.retain(|_, item| {
-            item.status == "queued"
-                || item.status == "running"
-                || now
-                    .duration_since(item.updated_at)
-                    .map(|age| age <= UPDATE_STATUS_RETENTION)
-                    .unwrap_or(true)
-        });
+        let progress = self.update_progress.read();
 
         let mut statuses: Vec<UpdateHealthStatus> = progress
             .iter()
+            .filter(|(_, item)| update_progress_is_visible(item, now))
             .map(|(index, item)| {
                 let elapsed_ms = now
                     .duration_since(item.started_at)

@@ -384,6 +384,11 @@ async fn process_batch(
             .get_index_config(&name_inner)
             .ok_or_else(|| format!("Failed to load config for index '{}'", name_inner))?;
 
+        // Windows cannot replace files that are still memory-mapped by the loaded index.
+        // POSIX keeps the old inode alive for readers, so only unload on Windows.
+        #[cfg(target_os = "windows")]
+        state_clone.unload_index(&name_inner);
+
         // Check and automatically repair sync issues between index and DB
         if let Err(e) = repair_index_db_sync(&path_str) {
             return Err(format!("Index/DB sync repair failed: {}", e));
@@ -1193,6 +1198,11 @@ pub async fn add_documents(
                 .index_path(&name_inner)
                 .to_string_lossy()
                 .to_string();
+
+            // Windows cannot replace files that are still memory-mapped by the loaded index.
+            // POSIX keeps the old inode alive for readers, so only unload on Windows.
+            #[cfg(target_os = "windows")]
+            state_clone.unload_index(&name_inner);
 
             // Check sync before updating: if filtering DB exists, counts must match
             let index_path = std::path::Path::new(&path_str);
