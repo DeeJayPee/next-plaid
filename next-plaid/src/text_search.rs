@@ -1040,14 +1040,15 @@ pub fn exists(index_path: &str) -> bool {
     if !db_path.exists() {
         return false;
     }
-    let Ok(conn) = crate::filtering::open_db_read(&db_path) else {
-        return false;
-    };
-    conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?",
-        [FTS_TABLE],
-        |row| row.get::<_, bool>(0),
-    )
+    crate::filtering::with_db_read(&db_path, |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?",
+                [FTS_TABLE],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false))
+    })
     .unwrap_or(false)
 }
 
@@ -1055,8 +1056,8 @@ pub fn exists(index_path: &str) -> bool {
 // Public API — search
 // =============================================================================
 
-/// Open a connection and verify the FTS5 table exists.
-fn open_fts_conn(index_path: &str) -> Result<Connection> {
+/// Run a read-only FTS operation after verifying the FTS5 table exists.
+fn with_fts_conn<T>(index_path: &str, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     let db_path = get_db_path(index_path);
     if !db_path.exists() {
         return Err(Error::Filtering(format!(
@@ -1065,23 +1066,24 @@ fn open_fts_conn(index_path: &str) -> Result<Connection> {
         )));
     }
 
-    let conn = crate::filtering::open_db_read(&db_path)?;
+    crate::filtering::with_db_read(&db_path, |conn| {
+        let fts_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?",
+                [FTS_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
 
-    let fts_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?",
-            [FTS_TABLE],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
+        if !fts_exists {
+            return Err(Error::Filtering(
+                "FTS5 index not found. Re-create metadata to build the full-text search index."
+                    .into(),
+            ));
+        }
 
-    if !fts_exists {
-        return Err(Error::Filtering(
-            "FTS5 index not found. Re-create metadata to build the full-text search index.".into(),
-        ));
-    }
-
-    Ok(conn)
+        f(conn)
+    })
 }
 
 /// Collect FTS5 query rows into a `QueryResult`.
@@ -1141,22 +1143,22 @@ pub fn search(index_path: &str, query: &str, top_k: usize) -> Result<QueryResult
         });
     }
 
-    let conn = open_fts_conn(index_path)?;
+    with_fts_conn(index_path, |conn| {
+        // FTS5 bm25() returns negative scores (lower = better match).
+        // We negate so higher = more relevant.
+        let sql = format!(
+            "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
+             FROM \"{}\" WHERE \"{}\" MATCH ? ORDER BY score DESC LIMIT ?",
+            FTS_TABLE, FTS_TABLE, FTS_TABLE
+        );
 
-    // FTS5 bm25() returns negative scores (lower = better match).
-    // We negate so higher = more relevant.
-    let sql = format!(
-        "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
-         FROM \"{}\" WHERE \"{}\" MATCH ? ORDER BY score DESC LIMIT ?",
-        FTS_TABLE, FTS_TABLE, FTS_TABLE
-    );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
-
-    let top_k_i64 = top_k as i64;
-    collect_fts_results(&mut stmt, &[&query as &dyn ToSql, &top_k_i64])
+        let top_k_i64 = top_k as i64;
+        collect_fts_results(&mut stmt, &[&query as &dyn ToSql, &top_k_i64])
+    })
 }
 
 /// Full-text search restricted to a subset of document IDs.
@@ -1185,48 +1187,48 @@ pub fn search_filtered(
         });
     }
 
-    let conn = open_fts_conn(index_path)?;
+    with_fts_conn(index_path, |conn| {
+        let mut merged: Vec<(i64, f32)> = Vec::new();
+        let top_k_i64 = top_k as i64;
 
-    let mut merged: Vec<(i64, f32)> = Vec::new();
-    let top_k_i64 = top_k as i64;
+        for chunk in subset.chunks(SQLITE_PARAM_LIMIT) {
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", chunk.len()).collect();
+            let sql = format!(
+                "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
+                 FROM \"{}\" WHERE \"{}\" MATCH ? AND rowid IN ({}) \
+                 ORDER BY score DESC LIMIT ?",
+                FTS_TABLE,
+                FTS_TABLE,
+                FTS_TABLE,
+                placeholders.join(", ")
+            );
 
-    for chunk in subset.chunks(SQLITE_PARAM_LIMIT) {
-        let placeholders: Vec<&str> = std::iter::repeat_n("?", chunk.len()).collect();
-        let sql = format!(
-            "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
-             FROM \"{}\" WHERE \"{}\" MATCH ? AND rowid IN ({}) \
-             ORDER BY score DESC LIMIT ?",
-            FTS_TABLE,
-            FTS_TABLE,
-            FTS_TABLE,
-            placeholders.join(", ")
-        );
+            let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(chunk.len() + 2);
+            params.push(Box::new(query.to_string()));
+            params.extend(chunk.iter().map(|&id| Box::new(id) as Box<dyn ToSql>));
+            params.push(Box::new(top_k_i64));
+            let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
 
-        let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(chunk.len() + 2);
-        params.push(Box::new(query.to_string()));
-        params.extend(chunk.iter().map(|&id| Box::new(id) as Box<dyn ToSql>));
-        params.push(Box::new(top_k_i64));
-        let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
+            let chunk_result = collect_fts_results(&mut stmt, &param_refs)?;
+            merged.extend(
+                chunk_result
+                    .passage_ids
+                    .into_iter()
+                    .zip(chunk_result.scores.into_iter()),
+            );
+        }
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
-        let chunk_result = collect_fts_results(&mut stmt, &param_refs)?;
-        merged.extend(
-            chunk_result
-                .passage_ids
-                .into_iter()
-                .zip(chunk_result.scores.into_iter()),
-        );
-    }
+        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(top_k);
 
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    merged.truncate(top_k);
-
-    Ok(QueryResult {
-        query_id: 0,
-        passage_ids: merged.iter().map(|(id, _)| *id).collect(),
-        scores: merged.into_iter().map(|(_, score)| score).collect(),
+        Ok(QueryResult {
+            query_id: 0,
+            passage_ids: merged.iter().map(|(id, _)| *id).collect(),
+            scores: merged.into_iter().map(|(_, score)| score).collect(),
+        })
     })
 }
 

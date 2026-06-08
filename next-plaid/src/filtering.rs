@@ -597,31 +597,14 @@ pub(crate) fn get_db_path(index_path: &str) -> std::path::PathBuf {
     Path::new(index_path).join(METADATA_DB_NAME)
 }
 
-static DB_OPEN_GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static DB_READ_CONNECTIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<Connection>>>>> =
+    OnceLock::new();
 
-fn db_open_gate(db_path: &Path) -> Arc<Mutex<()>> {
-    let key = db_path.to_path_buf();
-    let gates = DB_OPEN_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut gates = gates
-        .lock()
-        .expect("DB_OPEN_GATES mutex poisoned while creating metadata DB gate");
-    gates
-        .entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-/// Open a read-only SQLite connection for metadata queries.
-///
-/// Read connections deliberately do not run `PRAGMA journal_mode=WAL`: changing
-/// journal mode is write-ish SQLite setup work and can cause connection-open
-/// contention when many readers arrive while indexing writes metadata.
-pub(crate) fn open_db_read(db_path: &std::path::Path) -> Result<Connection> {
-    let gate = db_open_gate(db_path);
-    let _guard = gate
-        .lock()
-        .expect("metadata DB open gate mutex poisoned for read connection");
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+fn open_db_read_uncached(db_path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
     conn.execute_batch(
         "PRAGMA busy_timeout=5000;
          PRAGMA temp_store=MEMORY;
@@ -630,15 +613,56 @@ pub(crate) fn open_db_read(db_path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+fn read_connection(db_path: &Path) -> Result<Arc<Mutex<Connection>>> {
+    let key = db_path.to_path_buf();
+    let connections = DB_READ_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(conn) = connections
+        .lock()
+        .expect("DB_READ_CONNECTIONS mutex poisoned while reading metadata DB cache")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(conn);
+    }
+
+    let new_conn = Arc::new(Mutex::new(open_db_read_uncached(db_path)?));
+    let mut map = connections
+        .lock()
+        .expect("DB_READ_CONNECTIONS mutex poisoned while updating metadata DB cache");
+    Ok(map.entry(key).or_insert_with(|| new_conn).clone())
+}
+
+fn invalidate_read_connection(db_path: &Path) {
+    if let Some(connections) = DB_READ_CONNECTIONS.get() {
+        connections
+            .lock()
+            .expect("DB_READ_CONNECTIONS mutex poisoned while invalidating metadata DB cache")
+            .remove(db_path);
+    }
+}
+
+/// Open a read-only SQLite connection for metadata queries.
+///
+/// Read connections deliberately do not run `PRAGMA journal_mode=WAL`: changing
+/// journal mode is write-ish SQLite setup work and can cause connection-open
+/// contention when many readers arrive while indexing writes metadata.
+pub(crate) fn with_db_read<T>(
+    db_path: &std::path::Path,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let conn = read_connection(db_path)?;
+    let guard = conn
+        .lock()
+        .expect("cached metadata read connection mutex poisoned");
+    f(&guard)
+}
+
 /// Open a read-write SQLite connection for metadata mutation paths.
 ///
 /// WAL keeps readers unblocked during writes, while the open gate prevents
 /// bursts of threads from concurrently running connection setup on the same DB.
 pub(crate) fn open_db_write(db_path: &std::path::Path) -> Result<Connection> {
-    let gate = db_open_gate(db_path);
-    let _guard = gate
-        .lock()
-        .expect("metadata DB open gate mutex poisoned for write connection");
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
         "PRAGMA busy_timeout=5000;
@@ -773,6 +797,7 @@ fn create_with_fixed_columns(
 
     let db_path = get_db_path(index_path);
     if db_path.exists() {
+        invalidate_read_connection(&db_path);
         fs::remove_file(&db_path)?;
     }
 
@@ -839,6 +864,7 @@ pub fn create(index_path: &str, metadata: &[Value], doc_ids: &[i64]) -> Result<u
     // Remove existing database
     let db_path = get_db_path(index_path);
     if db_path.exists() {
+        invalidate_read_connection(&db_path);
         fs::remove_file(&db_path)?;
     }
 
@@ -1211,29 +1237,29 @@ pub fn where_condition(
         ));
     }
 
-    let conn = open_db_read(&db_path)?;
+    with_db_read(&db_path, |conn| {
+        // Validate condition against SQL injection
+        let valid_columns = get_schema_columns(conn)?;
+        validate_condition(condition, &valid_columns)?;
 
-    // Validate condition against SQL injection
-    let valid_columns = get_schema_columns(&conn)?;
-    validate_condition(condition, &valid_columns)?;
+        let query = format!(
+            "SELECT \"{}\" FROM METADATA WHERE {}",
+            SUBSET_COLUMN, condition
+        );
 
-    let query = format!(
-        "SELECT \"{}\" FROM METADATA WHERE {}",
-        SUBSET_COLUMN, condition
-    );
+        let params: Vec<Box<dyn ToSql>> = parameters.iter().map(json_to_sql).collect();
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
 
-    let params: Vec<Box<dyn ToSql>> = parameters.iter().map(json_to_sql).collect();
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(param_refs), |row| row.get::<_, i64>(0))?;
 
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params_from_iter(param_refs), |row| row.get::<_, i64>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
 
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-
-    Ok(result)
+        Ok(result)
+    })
 }
 
 /// Query document IDs with REGEXP support enabled.
@@ -1302,49 +1328,49 @@ pub fn where_condition_regexp(
             })?,
     );
 
-    let conn = open_db_read(&db_path)?;
+    with_db_read(&db_path, |conn| {
+        // Validate condition against SQL injection
+        let valid_columns = get_schema_columns(conn)?;
+        validate_condition(condition, &valid_columns)?;
 
-    // Validate condition against SQL injection
-    let valid_columns = get_schema_columns(&conn)?;
-    validate_condition(condition, &valid_columns)?;
+        // Register REGEXP function with pre-compiled regex (compiled once, used for all rows)
+        let re = compiled_regex.clone();
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                // Pattern argument from SQL is ignored - we use the pre-compiled regex
+                let _pattern: String = ctx.get(0)?;
+                let text: String = ctx.get(1)?;
 
-    // Register REGEXP function with pre-compiled regex (compiled once, used for all rows)
-    let re = compiled_regex.clone();
-    conn.create_scalar_function(
-        "regexp",
-        2,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8
-            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        move |ctx| {
-            // Pattern argument from SQL is ignored - we use the pre-compiled regex
-            let _pattern: String = ctx.get(0)?;
-            let text: String = ctx.get(1)?;
+                // `is_match` is `Result<bool>` under fancy-regex (the alt engine
+                // can fail with `backtrack_limit_exceeded` on adversarial input).
+                // Treat any such failure as "no match" so a single pathological
+                // chunk can't fail the whole query.
+                Ok(re.is_match(&text).unwrap_or(false))
+            },
+        )?;
 
-            // `is_match` is `Result<bool>` under fancy-regex (the alt engine
-            // can fail with `backtrack_limit_exceeded` on adversarial input).
-            // Treat any such failure as "no match" so a single pathological
-            // chunk can't fail the whole query.
-            Ok(re.is_match(&text).unwrap_or(false))
-        },
-    )?;
+        let query = format!(
+            "SELECT \"{}\" FROM METADATA WHERE {}",
+            SUBSET_COLUMN, condition
+        );
 
-    let query = format!(
-        "SELECT \"{}\" FROM METADATA WHERE {}",
-        SUBSET_COLUMN, condition
-    );
+        let params: Vec<Box<dyn ToSql>> = parameters.iter().map(json_to_sql).collect();
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
 
-    let params: Vec<Box<dyn ToSql>> = parameters.iter().map(json_to_sql).collect();
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(param_refs), |row| row.get::<_, i64>(0))?;
 
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params_from_iter(param_refs), |row| row.get::<_, i64>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
 
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-
-    Ok(result)
+        Ok(result)
+    })
 }
 
 /// Get distinct non-NULL string values from a single METADATA column.
@@ -1379,28 +1405,28 @@ pub fn get_distinct_strings(index_path: &str, column: &str) -> Result<Vec<String
         )));
     }
 
-    let conn = open_db_read(&db_path)?;
-
-    let columns = get_schema_columns(&conn)?;
-    if !columns.contains(column) {
-        return Ok(Vec::new());
-    }
-
-    let query = format!(
-        "SELECT DISTINCT \"{0}\" FROM METADATA WHERE \"{0}\" IS NOT NULL",
-        column
-    );
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-
-    let mut values: Vec<String> = Vec::new();
-    for row in rows {
-        if let Some(value) = row? {
-            values.push(value);
+    with_db_read(&db_path, |conn| {
+        let columns = get_schema_columns(conn)?;
+        if !columns.contains(column) {
+            return Ok(Vec::new());
         }
-    }
 
-    Ok(values)
+        let query = format!(
+            "SELECT DISTINCT \"{0}\" FROM METADATA WHERE \"{0}\" IS NOT NULL",
+            column
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+
+        let mut values: Vec<String> = Vec::new();
+        for row in rows {
+            if let Some(value) = row? {
+                values.push(value);
+            }
+        }
+
+        Ok(values)
+    })
 }
 
 /// Get full metadata rows by condition or subset IDs.
@@ -1439,92 +1465,92 @@ pub fn get(
         return Ok(Vec::new());
     }
 
-    let conn = open_db_read(&db_path)?;
-
-    // Validate condition against SQL injection if provided
-    if let Some(cond) = condition {
-        let valid_columns = get_schema_columns(&conn)?;
-        validate_condition(cond, &valid_columns)?;
-    }
-
-    // Get column names
-    let mut columns: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(METADATA)")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for row in rows {
-            columns.push(row?);
+    with_db_read(&db_path, |conn| {
+        // Validate condition against SQL injection if provided
+        if let Some(cond) = condition {
+            let valid_columns = get_schema_columns(conn)?;
+            validate_condition(cond, &valid_columns)?;
         }
-    }
 
-    if let Some(ids) = subset {
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        // Get column names
+        let mut columns: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(METADATA)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                columns.push(row?);
+            }
         }
+
+        if let Some(ids) = subset {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut results: Vec<Value> = Vec::new();
+            for chunk in ids.chunks(SQLITE_PARAM_LIMIT) {
+                let placeholders: Vec<&str> = std::iter::repeat_n("?", chunk.len()).collect();
+                let query = format!(
+                    "SELECT * FROM METADATA WHERE \"{}\" IN ({})",
+                    SUBSET_COLUMN,
+                    placeholders.join(", ")
+                );
+                let params: Vec<Box<dyn ToSql>> = chunk
+                    .iter()
+                    .map(|&id| Box::new(id) as Box<dyn ToSql>)
+                    .collect();
+                let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query(params_from_iter(param_refs))?;
+
+                while let Some(row) = rows.next()? {
+                    let mut obj = serde_json::Map::new();
+                    for (i, col) in columns.iter().enumerate() {
+                        let value = row_to_json_value(row, i)?;
+                        obj.insert(col.clone(), value);
+                    }
+                    results.push(Value::Object(obj));
+                }
+            }
+
+            let mut results_map: HashMap<i64, Value> = HashMap::new();
+            for result in results {
+                if let Some(id) = result.get(SUBSET_COLUMN).and_then(|v| v.as_i64()) {
+                    results_map.insert(id, result);
+                }
+            }
+            return Ok(ids.iter().filter_map(|id| results_map.remove(id)).collect());
+        }
+
+        // Build query
+        let (query, params): (String, Vec<Box<dyn ToSql>>) = if let Some(cond) = condition {
+            let query = format!(
+                "SELECT * FROM METADATA WHERE {} ORDER BY \"{}\"",
+                cond, SUBSET_COLUMN
+            );
+            let params = parameters.iter().map(json_to_sql).collect();
+            (query, params)
+        } else {
+            let query = format!("SELECT * FROM METADATA ORDER BY \"{}\"", SUBSET_COLUMN);
+            (query, Vec::new())
+        };
+
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(param_refs))?;
 
         let mut results: Vec<Value> = Vec::new();
-        for chunk in ids.chunks(SQLITE_PARAM_LIMIT) {
-            let placeholders: Vec<&str> = std::iter::repeat_n("?", chunk.len()).collect();
-            let query = format!(
-                "SELECT * FROM METADATA WHERE \"{}\" IN ({})",
-                SUBSET_COLUMN,
-                placeholders.join(", ")
-            );
-            let params: Vec<Box<dyn ToSql>> = chunk
-                .iter()
-                .map(|&id| Box::new(id) as Box<dyn ToSql>)
-                .collect();
-            let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
-            let mut stmt = conn.prepare(&query)?;
-            let mut rows = stmt.query(params_from_iter(param_refs))?;
-
-            while let Some(row) = rows.next()? {
-                let mut obj = serde_json::Map::new();
-                for (i, col) in columns.iter().enumerate() {
-                    let value = row_to_json_value(row, i)?;
-                    obj.insert(col.clone(), value);
-                }
-                results.push(Value::Object(obj));
+        while let Some(row) = rows.next()? {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in columns.iter().enumerate() {
+                let value = row_to_json_value(row, i)?;
+                obj.insert(col.clone(), value);
             }
+            results.push(Value::Object(obj));
         }
 
-        let mut results_map: HashMap<i64, Value> = HashMap::new();
-        for result in results {
-            if let Some(id) = result.get(SUBSET_COLUMN).and_then(|v| v.as_i64()) {
-                results_map.insert(id, result);
-            }
-        }
-        return Ok(ids.iter().filter_map(|id| results_map.remove(id)).collect());
-    }
-
-    // Build query
-    let (query, params): (String, Vec<Box<dyn ToSql>>) = if let Some(cond) = condition {
-        let query = format!(
-            "SELECT * FROM METADATA WHERE {} ORDER BY \"{}\"",
-            cond, SUBSET_COLUMN
-        );
-        let params = parameters.iter().map(json_to_sql).collect();
-        (query, params)
-    } else {
-        let query = format!("SELECT * FROM METADATA ORDER BY \"{}\"", SUBSET_COLUMN);
-        (query, Vec::new())
-    };
-
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
-    let mut stmt = conn.prepare(&query)?;
-    let mut rows = stmt.query(params_from_iter(param_refs))?;
-
-    let mut results: Vec<Value> = Vec::new();
-    while let Some(row) = rows.next()? {
-        let mut obj = serde_json::Map::new();
-        for (i, col) in columns.iter().enumerate() {
-            let value = row_to_json_value(row, i)?;
-            obj.insert(col.clone(), value);
-        }
-        results.push(Value::Object(obj));
-    }
-
-    Ok(results)
+        Ok(results)
+    })
 }
 
 /// Helper to convert a rusqlite row column to JSON value.
@@ -1715,9 +1741,10 @@ pub fn count(index_path: &str) -> Result<usize> {
         return Ok(0);
     }
 
-    let conn = open_db_read(&db_path)?;
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM METADATA", [], |row| row.get(0))?;
-    Ok(count as usize)
+    with_db_read(&db_path, |conn| {
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM METADATA", [], |row| row.get(0))?;
+        Ok(count as usize)
+    })
 }
 
 #[cfg(test)]
