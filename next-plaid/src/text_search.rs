@@ -482,7 +482,7 @@ pub fn index(
         ));
     }
 
-    let conn = crate::filtering::open_db(&db_path)?;
+    let conn = crate::filtering::open_db_write(&db_path)?;
     ensure_tables(&conn, tokenizer)?;
     insert_rows(&conn, metadata, doc_ids, tokenizer)?;
     Ok(())
@@ -508,7 +508,7 @@ pub fn delete(index_path: &str, doc_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
 
-    let conn = crate::filtering::open_db(&db_path)?;
+    let conn = crate::filtering::open_db_write(&db_path)?;
 
     // Check tables exist
     let has_content: bool = conn
@@ -584,7 +584,7 @@ pub fn update_rows(index_path: &str, doc_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
 
-    let conn = crate::filtering::open_db(&db_path)?;
+    let conn = crate::filtering::open_db_write(&db_path)?;
 
     // Check FTS tables exist
     let has_content: bool = conn
@@ -716,7 +716,7 @@ pub fn rebuild(index_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conn = crate::filtering::open_db(&db_path)?;
+    let conn = crate::filtering::open_db_write(&db_path)?;
 
     // Read stored tokenizer (default to Unicode61 for indices created before
     // the config table existed).
@@ -1040,7 +1040,7 @@ pub fn exists(index_path: &str) -> bool {
     if !db_path.exists() {
         return false;
     }
-    let Ok(conn) = crate::filtering::open_db(&db_path) else {
+    let Ok(conn) = crate::filtering::open_db_read(&db_path) else {
         return false;
     };
     conn.query_row(
@@ -1065,7 +1065,7 @@ fn open_fts_conn(index_path: &str) -> Result<Connection> {
         )));
     }
 
-    let conn = crate::filtering::open_db(&db_path)?;
+    let conn = crate::filtering::open_db_read(&db_path)?;
 
     let fts_exists: bool = conn
         .query_row(
@@ -1187,32 +1187,47 @@ pub fn search_filtered(
 
     let conn = open_fts_conn(index_path)?;
 
-    let (in_clause, in_params, temp_table) = build_in_clause(&conn, subset)?;
+    let mut merged: Vec<(i64, f32)> = Vec::new();
+    let top_k_i64 = top_k as i64;
 
-    let sql = format!(
-        "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
-         FROM \"{}\" WHERE \"{}\" MATCH ? AND rowid {} ORDER BY score DESC LIMIT ?",
-        FTS_TABLE, FTS_TABLE, FTS_TABLE, in_clause
-    );
+    for chunk in subset.chunks(SQLITE_PARAM_LIMIT) {
+        let placeholders: Vec<&str> = std::iter::repeat_n("?", chunk.len()).collect();
+        let sql = format!(
+            "SELECT rowid, CAST(-bm25(\"{}\") AS REAL) AS score \
+             FROM \"{}\" WHERE \"{}\" MATCH ? AND rowid IN ({}) \
+             ORDER BY score DESC LIMIT ?",
+            FTS_TABLE,
+            FTS_TABLE,
+            FTS_TABLE,
+            placeholders.join(", ")
+        );
 
-    let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(in_params.len() + 2);
-    params.push(Box::new(query.to_string()));
-    params.extend(in_params);
-    params.push(Box::new(top_k as i64));
+        let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(chunk.len() + 2);
+        params.push(Box::new(query.to_string()));
+        params.extend(chunk.iter().map(|&id| Box::new(id) as Box<dyn ToSql>));
+        params.push(Box::new(top_k_i64));
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
 
-    let param_refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
-
-    let result = collect_fts_results(&mut stmt, &param_refs);
-
-    if let Some(ref table_name) = temp_table {
-        drop_temp_table(&conn, table_name);
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Filtering(format!("Failed to prepare FTS5 query: {}", e)))?;
+        let chunk_result = collect_fts_results(&mut stmt, &param_refs)?;
+        merged.extend(
+            chunk_result
+                .passage_ids
+                .into_iter()
+                .zip(chunk_result.scores.into_iter()),
+        );
     }
 
-    result
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.truncate(top_k);
+
+    Ok(QueryResult {
+        query_id: 0,
+        passage_ids: merged.iter().map(|(id, _)| *id).collect(),
+        scores: merged.into_iter().map(|(_, score)| score).collect(),
+    })
 }
 
 // =============================================================================
