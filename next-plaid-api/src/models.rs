@@ -523,35 +523,52 @@ pub struct UpdateHealthStatus {
     /// Index name
     #[schema(example = "my-index")]
     pub index: String,
+    /// Identifier for the active aggregate update wave on this index
+    #[schema(example = "550e8400-e29b-41d4-a716-446655440000")]
+    pub update_id: String,
     /// Update status: queued, running, complete, failed
     #[schema(example = "running")]
     pub status: String,
     /// Current update stage
     #[schema(example = "centroid_expansion")]
     pub stage: String,
-    /// Number of documents queued for this update batch
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Number of documents accepted into this update wave
     #[schema(example = 300)]
-    pub queued_documents: Option<usize>,
-    /// Number of documents processed when known
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_documents: usize,
+    /// Number of documents currently being encoded
+    #[schema(example = 128)]
+    pub encoding_documents: usize,
+    /// Number of documents waiting for an index batch
+    #[schema(example = 300)]
+    pub queued_documents: usize,
+    /// Number of documents currently being written to the index
+    #[schema(example = 300)]
+    pub indexing_documents: usize,
+    /// Number of documents fully processed
     #[schema(example = 120)]
-    pub processed_documents: Option<usize>,
+    pub processed_documents: usize,
     /// RFC3339 timestamp for when this update started
     #[schema(example = "2026-05-22T01:04:12Z")]
     pub started_at: String,
+    /// RFC3339 timestamp for when the current stage started
+    #[schema(example = "2026-05-22T01:04:32Z")]
+    pub stage_started_at: String,
     /// RFC3339 timestamp for the last progress change
     #[schema(example = "2026-05-22T01:05:01Z")]
-    pub updated_at: String,
+    pub last_update_at: String,
     /// Milliseconds elapsed since this update started
     #[schema(example = 49000)]
-    pub elapsed_ms: u64,
+    pub total_elapsed_ms: u64,
+    /// Milliseconds elapsed since the current stage started
+    #[schema(example = 17000)]
+    pub stage_elapsed_ms: u64,
+    /// Fully processed documents per second for this update wave
+    #[schema(example = 44.78)]
+    pub docs_per_sec: f64,
     /// Human-readable current progress note
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "clustering outlier embeddings")]
     pub message: Option<String>,
     /// Failure message when status is failed
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Index update failed: NPY file too small")]
     pub error: Option<String>,
 }

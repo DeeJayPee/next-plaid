@@ -405,7 +405,7 @@ async fn process_batch(
     // Acquire per-index lock using full path for isolation
     let lock = get_index_lock_by_path(&path_str);
     let _guard = lock.lock().await;
-    state.record_update_stage(index_name, "batching", "processing queued update batch");
+    state.record_update_batch_started(index_name, doc_count, "processing queued update batch");
 
     // Run heavy work in blocking thread
     let result = task::spawn_blocking(move || -> Result<BatchMetrics, String> {
@@ -1196,7 +1196,7 @@ pub async fn add_documents(
     })?;
 
     let doc_count = embeddings.len();
-    state.record_update_queued(&name, doc_count, "document update queued");
+    state.record_update_accepted_for_queue(&name, doc_count);
 
     // Spawn background task
     tokio::spawn(async move {
@@ -1209,7 +1209,11 @@ pub async fn add_documents(
         // Clone name AGAIN for the inner closure, so `name_clone` stays valid for error logging
         let name_inner = name_clone.clone();
         let start = std::time::Instant::now();
-        state_clone.record_update_stage(&name_inner, "batching", "processing document update");
+        state_clone.record_update_batch_started(
+            &name_inner,
+            doc_count,
+            "processing document update",
+        );
         let result_state = state_clone.clone();
 
         // 2. Perform heavy IO work in a blocking task
@@ -1584,7 +1588,7 @@ pub async fn update_index(
             ApiError::Internal(format!("Batch worker for index '{}' is not running", name))
         }
     })?;
-    state.record_update_queued(&name, doc_count, "update queued for batching");
+    state.record_update_accepted_for_queue(&name, doc_count);
 
     tracing::debug!(
         index = %name,
@@ -1729,8 +1733,7 @@ pub async fn update_index_with_encoding(
             ApiError::Internal(format!("Batch worker for index '{}' is not running", name))
         }
     })?;
-    state.record_update_queued(&name, req.documents.len(), "encoding queued documents");
-    state.record_update_stage(&name, "encoding", "encoding documents");
+    state.record_update_accepted_for_encoding(&name, req.documents.len());
 
     // Now encode - we have a guaranteed slot in the batch queue
     let embeddings = match encode_texts_internal(
@@ -1758,7 +1761,7 @@ pub async fn update_index_with_encoding(
 
     // Send using the reserved permit - this is guaranteed to succeed
     permit.send(batch_item);
-    state.record_update_queued(&name, doc_count, "update queued for batching");
+    state.record_update_encoded_for_queue(&name, doc_count);
 
     tracing::debug!(
         index = %name,

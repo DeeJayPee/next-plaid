@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::{ArcSwap, Guard};
 use next_plaid::MmapIndex;
 use parking_lot::RwLock;
+use uuid::Uuid;
 
 /// Global registry of per-index loading locks to prevent concurrent loads.
 /// This prevents race conditions where multiple requests try to load the same
@@ -65,12 +66,17 @@ const UPDATE_STATUS_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone)]
 struct UpdateProgress {
+    update_id: Uuid,
     status: String,
     stage: String,
-    queued_documents: Option<usize>,
-    processed_documents: Option<usize>,
+    accepted_documents: usize,
+    encoding_documents: usize,
+    queued_documents: usize,
+    indexing_documents: usize,
+    processed_documents: usize,
     started_at: SystemTime,
-    updated_at: SystemTime,
+    stage_started_at: SystemTime,
+    last_update_at: SystemTime,
     message: Option<String>,
     error: Option<String>,
 }
@@ -111,9 +117,66 @@ fn update_progress_is_visible(item: &UpdateProgress, now: SystemTime) -> bool {
     item.status == "queued"
         || item.status == "running"
         || now
-            .duration_since(item.updated_at)
+            .duration_since(item.last_update_at)
             .map(|age| age <= UPDATE_STATUS_RETENTION)
             .unwrap_or(true)
+}
+
+fn active_update_documents(item: &UpdateProgress) -> usize {
+    item.encoding_documents
+        .saturating_add(item.queued_documents)
+        .saturating_add(item.indexing_documents)
+}
+
+fn update_is_terminal(item: &UpdateProgress) -> bool {
+    item.status == "complete" || item.status == "failed"
+}
+
+fn new_update_progress(
+    now: SystemTime,
+    status: &str,
+    stage: &str,
+    message: &str,
+) -> UpdateProgress {
+    UpdateProgress {
+        update_id: Uuid::new_v4(),
+        status: status.to_string(),
+        stage: stage.to_string(),
+        accepted_documents: 0,
+        encoding_documents: 0,
+        queued_documents: 0,
+        indexing_documents: 0,
+        processed_documents: 0,
+        started_at: now,
+        stage_started_at: now,
+        last_update_at: now,
+        message: Some(message.to_string()),
+        error: None,
+    }
+}
+
+fn set_update_stage(
+    item: &mut UpdateProgress,
+    status: &str,
+    stage: &str,
+    message: &str,
+    now: SystemTime,
+) {
+    if item.stage != stage {
+        item.stage = stage.to_string();
+        item.stage_started_at = now;
+    }
+    item.status = status.to_string();
+    item.last_update_at = now;
+    item.message = Some(message.to_string());
+    item.error = None;
+}
+
+fn update_progress_elapsed_ms(start: SystemTime, end: SystemTime) -> u64 {
+    end.duration_since(start)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// Configuration for the API server.
@@ -529,43 +592,120 @@ impl AppState {
         names
     }
 
-    /// Mark an update as queued.
-    pub fn record_update_queued(&self, name: &str, queued_documents: usize, message: &str) {
+    fn active_or_new_update<'a>(
+        progress: &'a mut HashMap<String, UpdateProgress>,
+        name: &str,
+        now: SystemTime,
+        status: &str,
+        stage: &str,
+        message: &str,
+    ) -> &'a mut UpdateProgress {
+        let needs_new_wave = progress
+            .get(name)
+            .map(|item| update_is_terminal(item) || !update_progress_is_visible(item, now))
+            .unwrap_or(true);
+
+        if needs_new_wave {
+            progress.insert(
+                name.to_string(),
+                new_update_progress(now, status, stage, message),
+            );
+        }
+
+        progress
+            .get_mut(name)
+            .expect("update progress entry should exist after insertion")
+    }
+
+    /// Accept already-encoded documents into the per-index batch queue.
+    pub fn record_update_accepted_for_queue(&self, name: &str, documents: usize) {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
         prune_expired_update_progress(&mut progress, now);
-        if let Some(existing) = progress.get_mut(name) {
-            existing.queued_documents = Some(
-                existing
-                    .queued_documents
-                    .unwrap_or(0)
-                    .saturating_add(queued_documents),
-            );
-            existing.updated_at = now;
-            existing.message = Some(message.to_string());
-            existing.error = None;
-            if existing.status != "running" {
-                existing.status = "queued".to_string();
-                existing.stage = "queued".to_string();
-                existing.processed_documents = None;
-                existing.started_at = now;
-            }
-            return;
-        }
-
-        progress.insert(
-            name.to_string(),
-            UpdateProgress {
-                status: "queued".to_string(),
-                stage: "queued".to_string(),
-                queued_documents: Some(queued_documents),
-                processed_documents: None,
-                started_at: now,
-                updated_at: now,
-                message: Some(message.to_string()),
-                error: None,
-            },
+        let entry = Self::active_or_new_update(
+            &mut progress,
+            name,
+            now,
+            "queued",
+            "queued",
+            "waiting for index batch",
         );
+        entry.accepted_documents = entry.accepted_documents.saturating_add(documents);
+        entry.queued_documents = entry.queued_documents.saturating_add(documents);
+        if entry.indexing_documents == 0 {
+            set_update_stage(entry, "queued", "queued", "waiting for index batch", now);
+        } else {
+            entry.last_update_at = now;
+            entry.error = None;
+        }
+    }
+
+    /// Accept raw text documents into encoding before they can be queued for indexing.
+    pub fn record_update_accepted_for_encoding(&self, name: &str, documents: usize) {
+        let now = SystemTime::now();
+        let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
+        let entry = Self::active_or_new_update(
+            &mut progress,
+            name,
+            now,
+            "running",
+            "encoding",
+            "encoding documents",
+        );
+        entry.accepted_documents = entry.accepted_documents.saturating_add(documents);
+        entry.encoding_documents = entry.encoding_documents.saturating_add(documents);
+        if entry.indexing_documents == 0 {
+            set_update_stage(entry, "running", "encoding", "encoding documents", now);
+        } else {
+            entry.last_update_at = now;
+            entry.error = None;
+        }
+    }
+
+    /// Move encoded documents from the encoding counter into the index batch queue.
+    pub fn record_update_encoded_for_queue(&self, name: &str, documents: usize) {
+        let now = SystemTime::now();
+        let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
+        let entry = Self::active_or_new_update(
+            &mut progress,
+            name,
+            now,
+            "queued",
+            "queued",
+            "waiting for index batch",
+        );
+        entry.encoding_documents = entry.encoding_documents.saturating_sub(documents);
+        entry.queued_documents = entry.queued_documents.saturating_add(documents);
+        if entry.indexing_documents == 0 {
+            let status = if entry.encoding_documents > 0 {
+                "running"
+            } else {
+                "queued"
+            };
+            let (stage, message) = if entry.encoding_documents > 0 {
+                ("encoding", "encoding documents")
+            } else {
+                ("queued", "waiting for index batch")
+            };
+            set_update_stage(entry, status, stage, message, now);
+        } else {
+            entry.last_update_at = now;
+            entry.error = None;
+        }
+    }
+
+    /// Move documents from the batch queue into active indexing.
+    pub fn record_update_batch_started(&self, name: &str, documents: usize, message: &str) {
+        let now = SystemTime::now();
+        let mut progress = self.update_progress.write();
+        prune_expired_update_progress(&mut progress, now);
+        let entry =
+            Self::active_or_new_update(&mut progress, name, now, "running", "batching", message);
+        entry.queued_documents = entry.queued_documents.saturating_sub(documents);
+        entry.indexing_documents = entry.indexing_documents.saturating_add(documents);
+        set_update_stage(entry, "running", "batching", message, now);
     }
 
     /// Mark an update as running at a new stage.
@@ -573,23 +713,8 @@ impl AppState {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
         prune_expired_update_progress(&mut progress, now);
-        let entry = progress
-            .entry(name.to_string())
-            .or_insert_with(|| UpdateProgress {
-                status: "running".to_string(),
-                stage: stage.to_string(),
-                queued_documents: None,
-                processed_documents: None,
-                started_at: now,
-                updated_at: now,
-                message: None,
-                error: None,
-            });
-        entry.status = "running".to_string();
-        entry.stage = stage.to_string();
-        entry.updated_at = now;
-        entry.message = Some(message.to_string());
-        entry.error = None;
+        let entry = Self::active_or_new_update(&mut progress, name, now, "running", stage, message);
+        set_update_stage(entry, "running", stage, message, now);
     }
 
     /// Mark an update as complete.
@@ -597,24 +722,22 @@ impl AppState {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
         prune_expired_update_progress(&mut progress, now);
-        let entry = progress
-            .entry(name.to_string())
-            .or_insert_with(|| UpdateProgress {
-                status: "complete".to_string(),
-                stage: "complete".to_string(),
-                queued_documents: Some(processed_documents),
-                processed_documents: None,
-                started_at: now,
-                updated_at: now,
-                message: None,
-                error: None,
-            });
-        entry.status = "complete".to_string();
-        entry.stage = "complete".to_string();
-        entry.processed_documents = Some(processed_documents);
-        entry.updated_at = now;
-        entry.message = Some(message.to_string());
-        entry.error = None;
+        let entry =
+            Self::active_or_new_update(&mut progress, name, now, "complete", "complete", message);
+        entry.indexing_documents = entry.indexing_documents.saturating_sub(processed_documents);
+        entry.processed_documents = entry
+            .processed_documents
+            .saturating_add(processed_documents);
+        if active_update_documents(entry) == 0 {
+            set_update_stage(entry, "complete", "complete", message, now);
+        } else if entry.indexing_documents > 0 {
+            entry.last_update_at = now;
+            entry.error = None;
+        } else if entry.encoding_documents > 0 {
+            set_update_stage(entry, "running", "encoding", "encoding documents", now);
+        } else {
+            set_update_stage(entry, "queued", "queued", "waiting for index batch", now);
+        }
     }
 
     /// Mark an update as failed.
@@ -622,22 +745,15 @@ impl AppState {
         let now = SystemTime::now();
         let mut progress = self.update_progress.write();
         prune_expired_update_progress(&mut progress, now);
-        let entry = progress
-            .entry(name.to_string())
-            .or_insert_with(|| UpdateProgress {
-                status: "failed".to_string(),
-                stage: "failed".to_string(),
-                queued_documents: None,
-                processed_documents: None,
-                started_at: now,
-                updated_at: now,
-                message: None,
-                error: None,
-            });
-        entry.status = "failed".to_string();
-        entry.stage = "failed".to_string();
-        entry.updated_at = now;
-        entry.message = Some("update failed".to_string());
+        let entry = Self::active_or_new_update(
+            &mut progress,
+            name,
+            now,
+            "failed",
+            "failed",
+            "update failed",
+        );
+        set_update_stage(entry, "failed", "failed", "update failed", now);
         entry.error = Some(error.to_string());
     }
 
@@ -650,27 +766,37 @@ impl AppState {
             .iter()
             .filter(|(_, item)| update_progress_is_visible(item, now))
             .map(|(index, item)| {
-                // For terminal states, freeze elapsed at the last update so a finished job
-                // doesn't keep "running up the clock" on every /health poll until it's pruned.
-                let end = if item.status == "complete" || item.status == "failed" {
-                    item.updated_at
+                // For terminal states, freeze elapsed values at the last update so a finished
+                // job doesn't keep "running up the clock" on every /health poll until pruned.
+                let end = if update_is_terminal(item) {
+                    item.last_update_at
                 } else {
                     now
                 };
-                let elapsed_ms = end
-                    .duration_since(item.started_at)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
+                let total_elapsed_ms = update_progress_elapsed_ms(item.started_at, end);
+                let stage_elapsed_ms = update_progress_elapsed_ms(item.stage_started_at, end);
+                let docs_per_sec = if item.processed_documents == 0 || total_elapsed_ms == 0 {
+                    0.0
+                } else {
+                    let raw = item.processed_documents as f64 / (total_elapsed_ms as f64 / 1_000.0);
+                    (raw * 100.0).round() / 100.0
+                };
                 UpdateHealthStatus {
                     index: index.clone(),
+                    update_id: item.update_id.to_string(),
                     status: item.status.clone(),
                     stage: item.stage.clone(),
+                    accepted_documents: item.accepted_documents,
+                    encoding_documents: item.encoding_documents,
                     queued_documents: item.queued_documents,
+                    indexing_documents: item.indexing_documents,
                     processed_documents: item.processed_documents,
                     started_at: system_time_to_rfc3339(item.started_at),
-                    updated_at: system_time_to_rfc3339(item.updated_at),
-                    elapsed_ms,
+                    stage_started_at: system_time_to_rfc3339(item.stage_started_at),
+                    last_update_at: system_time_to_rfc3339(item.last_update_at),
+                    total_elapsed_ms,
+                    stage_elapsed_ms,
+                    docs_per_sec,
                     message: item.message.clone(),
                     error: item.error.clone(),
                 }
@@ -757,7 +883,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{ApiConfig, AppState, UPDATE_STATUS_RETENTION};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn update_health_status_tracks_active_and_completed_updates() {
@@ -769,43 +895,143 @@ mod tests {
 
         assert!(state.get_update_health_statuses().is_empty());
 
-        state.record_update_queued("docs", 3, "queued");
+        state.record_update_accepted_for_queue("docs", 3);
         let queued = state.get_update_health_statuses();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].index, "docs");
         assert_eq!(queued[0].status, "queued");
-        assert_eq!(queued[0].queued_documents, Some(3));
+        assert_eq!(queued[0].stage, "queued");
+        assert_eq!(queued[0].accepted_documents, 3);
+        assert_eq!(queued[0].queued_documents, 3);
+        assert_eq!(queued[0].processed_documents, 0);
 
+        state.record_update_batch_started("docs", 3, "processing queued update batch");
         state.record_update_stage("docs", "kmeans", "clustering outlier embeddings");
         let running = state.get_update_health_statuses();
         assert_eq!(running[0].status, "running");
         assert_eq!(running[0].stage, "kmeans");
+        assert_eq!(running[0].queued_documents, 0);
+        assert_eq!(running[0].indexing_documents, 3);
 
         state.record_update_complete("docs", 3, "update complete");
         let complete = state.get_update_health_statuses();
         assert_eq!(complete[0].status, "complete");
-        assert_eq!(complete[0].processed_documents, Some(3));
+        assert_eq!(complete[0].stage, "complete");
+        assert_eq!(complete[0].processed_documents, 3);
+        assert_eq!(complete[0].indexing_documents, 0);
 
         state
             .update_progress
             .write()
             .get_mut("docs")
             .unwrap()
-            .updated_at = SystemTime::now() - UPDATE_STATUS_RETENTION - Duration::from_secs(1);
+            .last_update_at = SystemTime::now() - UPDATE_STATUS_RETENTION - Duration::from_secs(1);
         assert!(state.get_update_health_statuses().is_empty());
 
-        state.record_update_queued("other", 1, "queued");
+        state.record_update_accepted_for_queue("other", 1);
         assert!(!state.update_progress.read().contains_key("docs"));
     }
 
     #[test]
-    fn completed_update_elapsed_is_frozen_at_last_update() {
+    fn encoded_documents_move_to_queue_without_double_counting() {
         let temp_dir = tempfile::tempdir().unwrap();
         let state = AppState::new(ApiConfig {
             index_dir: temp_dir.path().to_path_buf(),
             default_top_k: 10,
         });
 
+        state.record_update_accepted_for_encoding("docs", 5);
+        let encoding = state.get_update_health_statuses();
+        assert_eq!(encoding[0].accepted_documents, 5);
+        assert_eq!(encoding[0].encoding_documents, 5);
+        assert_eq!(encoding[0].queued_documents, 0);
+        assert_eq!(encoding[0].message.as_deref(), Some("encoding documents"));
+
+        state.record_update_encoded_for_queue("docs", 5);
+        let queued = state.get_update_health_statuses();
+        assert_eq!(queued[0].accepted_documents, 5);
+        assert_eq!(queued[0].encoding_documents, 0);
+        assert_eq!(queued[0].queued_documents, 5);
+        assert_eq!(queued[0].stage, "queued");
+        assert_eq!(
+            queued[0].message.as_deref(),
+            Some("waiting for index batch")
+        );
+    }
+
+    #[test]
+    fn concurrent_acceptances_share_update_id_until_wave_completes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(ApiConfig {
+            index_dir: temp_dir.path().to_path_buf(),
+            default_top_k: 10,
+        });
+
+        state.record_update_accepted_for_queue("docs", 2);
+        let first = state.get_update_health_statuses()[0].clone();
+
+        state.record_update_accepted_for_encoding("docs", 3);
+        let second = state.get_update_health_statuses()[0].clone();
+        assert_eq!(first.update_id, second.update_id);
+        assert_eq!(second.accepted_documents, 5);
+        assert_eq!(second.queued_documents, 2);
+        assert_eq!(second.encoding_documents, 3);
+
+        state.record_update_encoded_for_queue("docs", 3);
+        state.record_update_batch_started("docs", 5, "processing queued update batch");
+        state.record_update_complete("docs", 5, "update complete");
+        let complete = state.get_update_health_statuses()[0].clone();
+        assert_eq!(complete.update_id, first.update_id);
+        assert_eq!(complete.status, "complete");
+
+        state.record_update_accepted_for_queue("docs", 1);
+        let next_wave = state.get_update_health_statuses()[0].clone();
+        assert_ne!(next_wave.update_id, first.update_id);
+        assert_eq!(next_wave.accepted_documents, 1);
+    }
+
+    #[test]
+    fn stage_started_at_changes_only_when_stage_changes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(ApiConfig {
+            index_dir: temp_dir.path().to_path_buf(),
+            default_top_k: 10,
+        });
+
+        state.record_update_accepted_for_queue("docs", 1);
+        {
+            let mut progress = state.update_progress.write();
+            let item = progress.get_mut("docs").unwrap();
+            item.stage_started_at = UNIX_EPOCH;
+        }
+
+        state.record_update_accepted_for_queue("docs", 1);
+        {
+            let progress = state.update_progress.read();
+            let item = progress.get("docs").unwrap();
+            assert_eq!(item.stage, "queued");
+            assert_eq!(item.stage_started_at, UNIX_EPOCH);
+        }
+
+        state.record_update_batch_started("docs", 2, "processing queued update batch");
+        {
+            let progress = state.update_progress.read();
+            let item = progress.get("docs").unwrap();
+            assert_eq!(item.stage, "batching");
+            assert_ne!(item.stage_started_at, UNIX_EPOCH);
+        }
+    }
+
+    #[test]
+    fn completed_update_elapsed_values_are_frozen_at_last_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(ApiConfig {
+            index_dir: temp_dir.path().to_path_buf(),
+            default_top_k: 10,
+        });
+
+        state.record_update_accepted_for_queue("docs", 5);
+        state.record_update_batch_started("docs", 5, "processing queued update batch");
         state.record_update_complete("docs", 5, "done");
 
         // Pin the timeline: started 60s ago, last updated (completed) 55s ago, so the true
@@ -815,14 +1041,59 @@ mod tests {
             let mut progress = state.update_progress.write();
             let item = progress.get_mut("docs").unwrap();
             item.started_at = now - Duration::from_secs(60);
-            item.updated_at = now - Duration::from_secs(55);
+            item.stage_started_at = now - Duration::from_secs(58);
+            item.last_update_at = now - Duration::from_secs(55);
         }
 
-        let elapsed = state.get_update_health_statuses()[0].elapsed_ms;
-        // Frozen at updated_at - started_at (~5s), not wall-clock-since-start (~60s).
+        let status = state.get_update_health_statuses()[0].clone();
+        // Frozen at last_update_at - started_at (~5s), not wall-clock-since-start (~60s).
         assert!(
-            (4_000..=6_000).contains(&elapsed),
-            "completed update elapsed_ms should freeze near 5s, got {elapsed}ms"
+            (4_000..=6_000).contains(&status.total_elapsed_ms),
+            "completed update total_elapsed_ms should freeze near 5s, got {}ms",
+            status.total_elapsed_ms
         );
+        assert!(
+            (2_000..=4_000).contains(&status.stage_elapsed_ms),
+            "completed update stage_elapsed_ms should freeze near 3s, got {}ms",
+            status.stage_elapsed_ms
+        );
+        assert_eq!(status.docs_per_sec, 1.0);
+    }
+
+    #[test]
+    fn docs_per_sec_uses_processed_documents_not_accepted_documents() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(ApiConfig {
+            index_dir: temp_dir.path().to_path_buf(),
+            default_top_k: 10,
+        });
+
+        state.record_update_accepted_for_queue("docs", 10);
+        {
+            let now = SystemTime::now();
+            let mut progress = state.update_progress.write();
+            let item = progress.get_mut("docs").unwrap();
+            item.started_at = now - Duration::from_secs(10);
+            item.last_update_at = now;
+        }
+
+        let queued = state.get_update_health_statuses()[0].clone();
+        assert_eq!(queued.processed_documents, 0);
+        assert_eq!(queued.docs_per_sec, 0.0);
+
+        state.record_update_batch_started("docs", 10, "processing queued update batch");
+        state.record_update_complete("docs", 4, "partial batch complete");
+        {
+            let now = SystemTime::now();
+            let mut progress = state.update_progress.write();
+            let item = progress.get_mut("docs").unwrap();
+            item.started_at = now - Duration::from_secs(10);
+            item.last_update_at = now;
+        }
+
+        let status = state.get_update_health_statuses()[0].clone();
+        assert_eq!(status.accepted_documents, 10);
+        assert_eq!(status.processed_documents, 4);
+        assert_eq!(status.docs_per_sec, 0.4);
     }
 }
