@@ -877,6 +877,10 @@ Examples:
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    let update_batch_timeout_ms: u64 = std::env::var("UPDATE_BATCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
     let max_batch_texts: usize = std::env::var("MAX_BATCH_TEXTS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -890,6 +894,7 @@ Examples:
         concurrency_limit = concurrency_limit,
         max_queued_tasks = max_queued_tasks,
         max_batch_documents = max_batch_documents,
+        update_batch_timeout_ms = update_batch_timeout_ms,
         max_batch_texts = max_batch_texts,
         "server.started"
     );

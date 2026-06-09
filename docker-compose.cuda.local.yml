@@ -39,6 +39,7 @@ services:
       # Document processing configuration
       - MAX_QUEUED_TASKS_PER_INDEX=${MAX_QUEUED_TASKS_PER_INDEX:-20}
       - MAX_BATCH_DOCUMENTS=${MAX_BATCH_DOCUMENTS:-500}
+      - UPDATE_BATCH_TIMEOUT_MS=${UPDATE_BATCH_TIMEOUT_MS:-100}
       - BATCH_CHANNEL_SIZE=${BATCH_CHANNEL_SIZE:-200}
       # Encode batching configuration
       - MAX_BATCH_TEXTS=${MAX_BATCH_TEXTS:-128}

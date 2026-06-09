@@ -206,7 +206,17 @@ fn max_batch_documents() -> usize {
 }
 
 /// Maximum time to wait for more documents before processing a batch.
-const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
+/// Configurable via UPDATE_BATCH_TIMEOUT_MS env var (default: 100ms).
+fn batch_timeout() -> Duration {
+    static VALUE: OnceLock<Duration> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let millis = std::env::var("UPDATE_BATCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        Duration::from_millis(millis)
+    })
+}
 
 /// Get the channel buffer size for batch queue.
 /// Configurable via BATCH_CHANNEL_SIZE env var (default: 100).
@@ -319,7 +329,7 @@ fn get_or_create_batch_queue(name: &str, state: Arc<AppState>) -> mpsc::Sender<B
 ///
 /// The worker waits for items on the channel and batches them until either:
 /// - The total document count reaches MAX_BATCH_DOCUMENTS, or
-/// - BATCH_TIMEOUT has elapsed since the first item arrived
+/// - UPDATE_BATCH_TIMEOUT_MS has elapsed since the first item arrived
 async fn batch_worker(
     mut receiver: mpsc::Receiver<BatchItem>,
     index_name: String,
@@ -341,7 +351,7 @@ async fn batch_worker(
         let mut batch_embeddings: Vec<Array2<f32>> = first_item.embeddings;
         let mut batch_metadata: Vec<serde_json::Value> = first_item.metadata;
         let mut doc_count = batch_embeddings.len();
-        let deadline = Instant::now() + BATCH_TIMEOUT;
+        let deadline = Instant::now() + batch_timeout();
 
         // Collect more items until timeout or max batch size
         while doc_count < max_batch_documents() {

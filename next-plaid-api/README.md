@@ -833,6 +833,7 @@ at startup.
 | ---------------------------- | ------- | --------------------------------------------- |
 | `MAX_QUEUED_TASKS_PER_INDEX` | `10`    | Max pending updates per index (503 when full) |
 | `MAX_BATCH_DOCUMENTS`        | `300`   | Documents per batch before processing         |
+| `UPDATE_BATCH_TIMEOUT_MS`    | `100`   | Max wait time to collect an update batch      |
 | `BATCH_CHANNEL_SIZE`         | `100`   | Buffer for document batch queue               |
 
 ### Encode Batching

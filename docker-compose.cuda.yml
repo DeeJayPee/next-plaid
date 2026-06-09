@@ -27,6 +27,7 @@
 #   CONCURRENCY_LIMIT           Max concurrent in-flight requests (default: 200)
 #   MAX_QUEUED_TASKS_PER_INDEX  Max queued updates/deletes per index (default: 20)
 #   MAX_BATCH_DOCUMENTS         Max documents to batch before processing (default: 500)
+#   UPDATE_BATCH_TIMEOUT_MS     Max wait time to collect update batch (default: 100)
 #   BATCH_CHANNEL_SIZE          Buffer size for document batch queue (default: 200)
 #   MAX_BATCH_TEXTS             Max texts to batch for encoding (default: 128)
 #   ENCODE_BATCH_CHANNEL_SIZE   Buffer size for encode batch queue (default: 512)
@@ -79,6 +80,7 @@ services:
       # Document processing configuration
       - MAX_QUEUED_TASKS_PER_INDEX=${MAX_QUEUED_TASKS_PER_INDEX:-20}
       - MAX_BATCH_DOCUMENTS=${MAX_BATCH_DOCUMENTS:-500}
+      - UPDATE_BATCH_TIMEOUT_MS=${UPDATE_BATCH_TIMEOUT_MS:-100}
       - BATCH_CHANNEL_SIZE=${BATCH_CHANNEL_SIZE:-200}
       # Encode batching configuration
       - MAX_BATCH_TEXTS=${MAX_BATCH_TEXTS:-64}
